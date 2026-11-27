@@ -12,7 +12,7 @@ let db;
 const hash=x=>createHash('sha256').update(x).digest('hex');
 const token=()=>randomBytes(32).toString('hex');
 const same=(a,b)=>typeof a==='string'&&typeof b==='string'&&a.length===b.length&&timingSafeEqual(Buffer.from(a),Buffer.from(b));
-const ready=()=>!!(db&&e.ADMIN_TOKEN?.length>=32&&e.HAMYON_SHOP_ID&&e.HAMYON_SHOP_KEY&&e.PUBLIC_URL);
+const ready=()=>!!(db&&e.ADMIN_TOKEN?.length>=32&&e.HAMYON_SHOP_ID&&!e.HAMYON_SHOP_ID.startsWith('REPLACE_')&&e.HAMYON_SHOP_KEY&&!e.HAMYON_SHOP_KEY.startsWith('REPLACE_')&&e.PUBLIC_URL);
 const p=()=>db.collection('payments'), projects=()=>db.collection('projects');
 const bearer=q=>q.get('authorization')?.replace(/^Bearer /,'')||'';
 const fail=(r,s,error)=>r.status(s).json({error});
