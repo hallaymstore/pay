@@ -1,0 +1,35 @@
+import express from 'express';
+import helmet from 'helmet';
+import {rateLimit} from 'express-rate-limit';
+import {MongoClient} from 'mongodb';
+import {randomBytes,randomInt,createHash,timingSafeEqual} from 'node:crypto';
+const app=express(), e=process.env;
+app.set('trust proxy',1); app.disable('x-powered-by');
+app.use(helmet()); app.use(express.json({limit:'16kb'})); app.use(express.urlencoded({extended:false,limit:'12kb'}));
+app.use(rateLimit({windowMs:60000,limit:120,standardHeaders:true,legacyHeaders:false}));
+app.use('/api',(_,r,n)=>{r.set('Cache-Control','no-store');n()});
+let db;
+const hash=x=>createHash('sha256').update(x).digest('hex');
+const token=()=>randomBytes(32).toString('hex');
+const same=(a,b)=>typeof a==='string'&&typeof b==='string'&&a.length===b.length&&timingSafeEqual(Buffer.from(a),Buffer.from(b));
+const ready=()=>!!(db&&e.ADMIN_TOKEN?.length>=32&&e.HAMYON_SHOP_ID&&e.HAMYON_SHOP_KEY&&e.PUBLIC_URL);
+const p=()=>db.collection('payments'), projects=()=>db.collection('projects');
+const bearer=q=>q.get('authorization')?.replace(/^Bearer /,'')||'';
+const fail=(r,s,error)=>r.status(s).json({error});
+const admin=(q,r,n)=>db&&e.ADMIN_TOKEN?.length>=32&&same(hash(bearer(q)),hash(e.ADMIN_TOKEN))?n():fail(r,403,'Ruxsat yo‘q');
+const auth=async(q,r,n)=>{if(!db)return fail(r,503,'Database unavailable');q.project=await projects().findOne({keyHash:hash(bearer(q)),enabled:true});if(!q.project)return fail(r,401,'API key invalid');n()};
+const safe=x=>({id:x._id,order_id:x.orderId,amount:x.amount,base_amount:x.baseAmount,status:x.status,created_at:x.createdAt,checkout_url:e.PUBLIC_URL+'/checkout/'+x._id});
+app.get('/health',(_,r)=>r.json({online:true,database:!!db,paymentsReady:ready()}));
+app.get('/api/admin/projects',admin,async(_,r)=>r.json(await projects().find({}, {projection:{keyHash:0}}).limit(100).toArray()));
+app.post('/api/admin/projects',admin,async(q,r)=>{const name=q.body.name;if(typeof name!=='string'||name.trim().length<2||name.length>80)return fail(r,400,'Nom noto‘g‘ri');const key=token(),doc={_id:token(),name:name.trim(),keyHash:hash(key),enabled:true,createdAt:new Date()};await projects().insertOne(doc);r.status(201).json({id:doc._id,name:doc.name,api_key:key})});
+app.get('/api/admin/payments',admin,async(_,r)=>r.json((await p().find().sort({createdAt:-1}).limit(100).toArray()).map(safe)));
+app.post('/api/v1/payments/create',auth,async(q,r)=>{if(!ready())return fail(r,503,'To‘lov xizmati sozlanmagan');const {amount,order_id}=q.body;if(!Number.isSafeInteger(amount)||amount<1000||amount>100000000||typeof order_id!=='string'||order_id.length<1||order_id.length>100)return fail(r,400,'Invalid amount or order_id');const filter={projectId:q.project._id,orderId:order_id};const old=await p().findOne(filter);if(old){if(old.baseAmount!==amount)return fail(r,409,'Order amount conflict');return r.json(safe(old))}let doc;for(let i=0;i<30;i++){try{doc={_id:token(),...filter,baseAmount:amount,amount:amount+randomInt(1,1000),status:'creating',reserved:true,createdAt:new Date()};await p().insertOne(doc);break}catch(err){doc=null;if(err.code!==11000)throw err;const existing=await p().findOne(filter);if(existing)return existing.baseAmount===amount?r.json(safe(existing)):fail(r,409,'Order conflict')}}if(!doc)return fail(r,409,'Amount unavailable');try{const res=await fetch('https://hamyon-api.uz/payment/create',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({shop_id:e.HAMYON_SHOP_ID,shop_key:e.HAMYON_SHOP_KEY,amount:String(doc.amount),order_id:doc._id}),redirect:'error',signal:AbortSignal.timeout(15000)});const b=await res.json();const card=String(b.card||'').replace(/ /g,'');if(!res.ok||b.error||!b.payment_id||!/^\d{16}$/.test(card))throw Error('provider');Object.assign(doc,{card,providerId:String(b.payment_id),status:'pending'});await p().updateOne({_id:doc._id,status:'creating'},{$set:{card,providerId:doc.providerId,status:'pending'}});r.status(201).json(safe(doc))}catch{await p().updateOne({_id:doc._id,status:'creating'},{$set:{status:'review'}});fail(r,502,'Provider result uncertain; manual review required')}});
+async function verify(doc){if(!ready()||!doc.providerId||doc.status==='paid')return;const url=new URL('https://hamyon-api.uz/payment/status');url.searchParams.set('payment_id',doc.providerId);const response=await fetch(url,{redirect:'error',signal:AbortSignal.timeout(12000)});if(!response.ok)throw Error('provider');const b=await response.json();if(String(b.payment_id)!==doc.providerId||String(b.order_id)!==doc._id||String(b.shop_id)!==e.HAMYON_SHOP_ID||Number(b.amount)!==doc.amount)throw Error('mismatch');if(b.status==='paid')await p().updateOne({_id:doc._id,providerId:doc.providerId,status:{$ne:'paid'}},{$set:{status:'paid',paidAt:new Date(),reserved:false}});else if(b.status==='cancel')await p().updateOne({_id:doc._id,status:'pending'},{$set:{status:'cancelled',reserved:false}})}
+app.get('/api/v1/payments/:id',auth,async(q,r)=>{const doc=await p().findOne({_id:q.params.id,projectId:q.project._id});if(!doc)return fail(r,404,'Not found');r.json(safe(doc))});
+app.get('/api/checkout/:id',async(q,r)=>{if(!db)return fail(r,503,'Unavailable');const doc=await p().findOne({_id:q.params.id});if(!doc)return fail(r,404,'Not found');r.json({amount:doc.amount,base_amount:doc.baseAmount,status:doc.status,card:doc.status==='pending'?doc.card:null})});
+for(const step of ['prepare','complete'])app.post('/api/hamyon/'+step,async(q,r)=>{if(!ready())return fail(r,503,'Unavailable');const b=q.body;const {shop_id,payment_id,amount,sign,order_id}=b;if(![shop_id,payment_id,amount,sign,order_id].every(x=>typeof x==='string')||shop_id!==e.HAMYON_SHOP_ID||!/^\d+$/.test(amount))return fail(r,403,'Invalid');const expected=createHash('md5').update(shop_id+payment_id+amount+e.HAMYON_SHOP_KEY).digest('hex');if(!same(sign.toLowerCase(),expected))return fail(r,403,'Invalid');const doc=await p().findOne({_id:order_id,amount:Number(amount),providerId:payment_id});if(!doc)return fail(r,404,'Not found');if(step==='complete')await verify(doc);r.json({result:'ok'})});
+let busy=false;setInterval(async()=>{if(!ready()||busy)return;busy=true;try{for(const doc of await p().find({status:'pending',providerId:{$exists:true}}).sort({checkedAt:1}).limit(30).toArray()){try{await verify(doc)}catch{}await p().updateOne({_id:doc._id},{$set:{checkedAt:new Date()}})}}finally{busy=false}},20000).unref();
+app.use(express.static('public',{index:false}));app.get(['/', '/checkout/:id'],(_,r)=>r.sendFile(process.cwd()+'/public/index.html'));
+app.use((err,q,r,n)=>{console.error('Request failed',err.name);if(!r.headersSent)fail(r,500,'Server error')});
+if(e.MONGODB_URI){const client=new MongoClient(e.MONGODB_URI,{serverSelectionTimeoutMS:10000});await client.connect();db=client.db('hallaympay');await p().createIndex({projectId:1,orderId:1},{unique:true});await p().createIndex({amount:1},{unique:true,partialFilterExpression:{reserved:true}});await p().createIndex({providerId:1},{unique:true,sparse:true});await projects().createIndex({keyHash:1},{unique:true})}
+app.listen(process.env.PORT||3000,'0.0.0.0');
