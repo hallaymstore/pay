@@ -1,0 +1,19 @@
+{
+  "name": "hallaym-pay",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --check server.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "mongodb": "^6.16.0",
+    "helmet": "^8.1.0",
+    "express-rate-limit": "^7.5.0"
+  }
+}
